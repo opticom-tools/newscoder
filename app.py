@@ -1,8 +1,14 @@
 import re
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 import streamlit as st
 from anthropic import Anthropic
+
+# Try to import typed errors (available in newer anthropic SDKs)
+try:
+    from anthropic import NotFoundError, AuthenticationError, RateLimitError, APIError  # type: ignore
+except Exception:  # pragma: no cover
+    NotFoundError = AuthenticationError = RateLimitError = APIError = Exception  # fallback
 
 
 # ---------------------------
@@ -24,14 +30,11 @@ def parse_excel_paste(pasted: str) -> List[str]:
             cells = [c.strip() for c in line.split("\t") if c.strip()]
             if not cells:
                 continue
-            # Choose the longest cell as the answer (usually the free-text column)
             candidate = max(cells, key=len)
-            # If the "longest" cell is still tiny, fall back to the last cell
             if len(candidate) < 5 and len(cells) >= 2:
                 candidate = cells[-1]
             line = candidate.strip()
 
-        # Skip accidental headers
         lower = line.lower()
         if lower in {"answer", "answers", "response", "responses", "svar", "kommentar", "comments"}:
             continue
@@ -42,10 +45,6 @@ def parse_excel_paste(pasted: str) -> List[str]:
 
 
 def downsample_evenly(items: List[str], max_n: int) -> Tuple[List[str], bool]:
-    """
-    If items exceed max_n, select an evenly-spaced sample (deterministic).
-    Ensures the first and last items are included when possible.
-    """
     if max_n <= 0 or len(items) <= max_n:
         return items, False
 
@@ -53,9 +52,7 @@ def downsample_evenly(items: List[str], max_n: int) -> Tuple[List[str], bool]:
     if max_n == 1:
         return [items[0]], True
 
-    # Evenly spaced indices across [0, n-1]
     indices = [round(i * (n - 1) / (max_n - 1)) for i in range(max_n)]
-    # De-duplicate while preserving order
     seen = set()
     sampled = []
     for idx in indices:
@@ -67,9 +64,6 @@ def downsample_evenly(items: List[str], max_n: int) -> Tuple[List[str], bool]:
 
 
 def extract_text_from_anthropic_message(message) -> str:
-    """
-    Anthropics SDK returns content blocks. We join any text blocks.
-    """
     parts = []
     for block in getattr(message, "content", []) or []:
         text = getattr(block, "text", None)
@@ -79,20 +73,10 @@ def extract_text_from_anthropic_message(message) -> str:
 
 
 def looks_like_valid_output(md: str) -> bool:
-    """
-    Basic validation:
-    - Must be non-empty
-    - Should contain 3 article headings (## Article 1/2/3)
-    - Should be Markdown-ish and not obviously something else
-    """
     if not md or not md.strip():
         return False
-
-    # If Claude wrapped in code fences despite instruction, we can still salvage it,
-    # but it counts as "invalid" for the first pass.
     if "```" in md:
         return False
-
     needed = [r"^##\s*Article\s*1\b", r"^##\s*Article\s*2\b", r"^##\s*Article\s*3\b"]
     for pat in needed:
         if not re.search(pat, md, flags=re.MULTILINE | re.IGNORECASE):
@@ -101,33 +85,19 @@ def looks_like_valid_output(md: str) -> bool:
 
 
 def strip_code_fences(md: str) -> str:
-    """
-    Remove triple backtick blocks if they appear.
-    """
-    # Remove surrounding code fences if the whole thing is fenced
     fenced = re.match(r"^\s*```(?:\w+)?\s*(.*?)\s*```\s*$", md, flags=re.DOTALL)
     if fenced:
         return fenced.group(1).strip()
-
-    # Otherwise, remove any code fences lines
     md = re.sub(r"(?m)^\s*```.*?$", "", md)
     return md.strip()
 
 
 def split_into_three_articles(md: str) -> Tuple[str, str, str, bool]:
-    """
-    Split output into 3 Markdown strings based on headings:
-    ## Article 1 ...
-    ## Article 2 ...
-    ## Article 3 ...
-    Returns (a1, a2, a3, success_flag)
-    """
     pattern = r"(?m)^##\s*Article\s*([123])\b.*$"
     matches = list(re.finditer(pattern, md, flags=re.IGNORECASE | re.MULTILINE))
     if len(matches) < 3:
         return md.strip(), "", "", False
 
-    # Map first occurrence of each number -> start index
     starts: Dict[str, int] = {}
     for m in matches:
         num = m.group(1)
@@ -137,7 +107,6 @@ def split_into_three_articles(md: str) -> Tuple[str, str, str, bool]:
     if not all(k in starts for k in ("1", "2", "3")):
         return md.strip(), "", "", False
 
-    # Sort by start index and slice
     ordered = sorted(((k, v) for k, v in starts.items()), key=lambda x: x[1])
     slices = {}
     for i, (num, start) in enumerate(ordered):
@@ -147,27 +116,12 @@ def split_into_three_articles(md: str) -> Tuple[str, str, str, bool]:
     return slices["1"], slices["2"], slices["3"], True
 
 
-def build_prompt(
-    question: str,
-    answers: List[str],
-    optional_context: str,
-    company_name: str,
-) -> str:
-    """
-    Build a single, explicit prompt that:
-    - Extracts patterns from answers
-    - Writes 3 distinct LinkedIn articles
-    - Protects confidentiality
-    - Outputs Markdown only
-    """
-    # Format answers as a numbered list for clarity
+def build_prompt(question: str, answers: List[str], optional_context: str, company_name: str) -> str:
     answers_block = "\n".join([f"{i+1}. {a}" for i, a in enumerate(answers)])
-
     ctx = (optional_context or "").strip()
     ctx_block = ctx if ctx else "No extra context provided."
 
-    # Very explicit output format requirements
-    prompt = f"""
+    return f"""
 You are a senior thought-leadership writer specialising in the forest industry and its value chain (pulp, paper, packaging, hygiene, timber, printing/publishing, brand owners, converters, logistics, procurement, sustainability, innovation).
 
 TASK
@@ -220,12 +174,10 @@ STYLE (LinkedIn-ready)
 
 QUALITY BAR
 Each article must have a distinct:
-- angle (e.g., risk, strategy, operating model, market dynamics, innovation tension, sustainability credibility, procurement logic),
+- angle,
 - narrative arc (hook → insight → implications → takeaway),
 - emphasis (choose different themes across the three).
 """.strip()
-
-    return prompt
 
 
 def call_claude_markdown(prompt: str, model: str, max_tokens: int, temperature: float) -> str:
@@ -240,6 +192,18 @@ def call_claude_markdown(prompt: str, model: str, max_tokens: int, temperature: 
     return extract_text_from_anthropic_message(message)
 
 
+def friendly_model_error(model_id: str) -> str:
+    return (
+        f"Model not found: **{model_id}**\n\n"
+        "Fix: pick a valid Anthropic model ID in **1. Context → Model**.\n"
+        "Recommended defaults:\n"
+        "- `claude-sonnet-4-5-20250929` (stable snapshot)\n"
+        "- `claude-sonnet-4-5` (alias)\n"
+        "- `claude-haiku-4-5` (faster/cheaper)\n"
+        "- `claude-opus-4-5` (premium)\n"
+    )
+
+
 # ---------------------------
 # Streamlit UI
 # ---------------------------
@@ -251,18 +215,40 @@ st.write(
     "credible, anonymised, and designed for senior decision-makers in the forest industry."
 )
 
+MODEL_PRESETS = {
+    "Claude Sonnet 4.5 — stable snapshot (recommended)": "claude-sonnet-4-5-20250929",
+    "Claude Sonnet 4.5 — alias": "claude-sonnet-4-5",
+    "Claude Haiku 4.5 — alias (fast/cheap)": "claude-haiku-4-5",
+    "Claude Opus 4.5 — alias (premium)": "claude-opus-4-5",
+    "Custom (type your own model ID)": "__custom__",
+}
+
 with st.expander("1. Context", expanded=True):
     st.caption("Optional framing — keep it light. The app will still work if you leave this empty.")
     company_name = st.text_input("Company name (used subtly in the articles)", value="Opticom")
+
     optional_context = st.text_area(
         "Optional context (e.g., what this question was about, what theme you want to emphasise, what audience nuance to consider)",
-        placeholder="Example: These answers come from conversations with publishers/printers and brand owners about decision-making around paper quality, supply reliability, and sustainability claims.",
+        placeholder="Example: These answers come from conversations across the value chain about supply reliability, credibility of claims, and procurement trade-offs.",
         height=120,
     )
 
-    col_a, col_b, col_c = st.columns([1, 1, 1])
+    col_a, col_b, col_c = st.columns([1.2, 1, 1])
     with col_a:
-        model = st.text_input("Claude model", value="claude-3-5-sonnet-latest")
+        model_choice = st.selectbox("Model", list(MODEL_PRESETS.keys()), index=0)
+        custom_model = ""
+        if MODEL_PRESETS[model_choice] == "__custom__":
+            custom_model = st.text_input("Custom model ID", placeholder="e.g. claude-sonnet-4-5-20250929")
+
+        model_id = custom_model.strip() if custom_model.strip() else MODEL_PRESETS[model_choice]
+        if model_id == "__custom__":
+            model_id = ""  # force validation below
+
+        st.caption(
+            "If you previously used `claude-3-5-sonnet-latest`, it will 404 (model ID no longer exists). "
+            "Use one of the options above."
+        )
+
     with col_b:
         max_answers_to_send = st.number_input("Max answers to send to Claude", min_value=20, max_value=500, value=160, step=10)
     with col_c:
@@ -296,6 +282,10 @@ if "result_md" not in st.session_state:
 
 if generate:
     # --- Validation
+    if not model_id or not model_id.strip():
+        st.error("Please select a model (or type a custom model ID).")
+        st.stop()
+
     if not question or not question.strip():
         st.error("Please add the interview question.")
         st.stop()
@@ -329,10 +319,27 @@ if generate:
         try:
             md = call_claude_markdown(
                 prompt=prompt,
-                model=model.strip(),
+                model=model_id.strip(),
                 max_tokens=2500,
                 temperature=float(temperature),
             )
+        except NotFoundError as e:
+            st.error("Claude call failed: model not found.")
+            st.markdown(friendly_model_error(model_id.strip()))
+            st.exception(e)
+            st.stop()
+        except AuthenticationError as e:
+            st.error("Claude call failed: authentication error (check ANTHROPIC_API_KEY in Streamlit Secrets).")
+            st.exception(e)
+            st.stop()
+        except RateLimitError as e:
+            st.error("Claude call failed: rate limit. Try again in a moment.")
+            st.exception(e)
+            st.stop()
+        except APIError as e:
+            st.error("Claude call failed: API error.")
+            st.exception(e)
+            st.stop()
         except Exception as e:
             st.error("Claude call failed. Check your model name and API key in Streamlit Secrets.")
             st.exception(e)
@@ -344,18 +351,22 @@ if generate:
         st.error("Claude returned an empty response. Please try again.")
         st.stop()
 
-    # If Claude returned code fences, strip them and treat as invalid first pass
     if "```" in md:
         md = strip_code_fences(md)
 
     # Validate format; if invalid, attempt ONE repair call
     if not looks_like_valid_output(md):
-        repair_prompt = prompt + "\n\nIMPORTANT: Your previous output did not match the required Markdown structure. Re-output ONLY in the exact required structure with three headings (## Article 1/2/3) and 200–400 words per article. No code fences."
+        repair_prompt = (
+            prompt
+            + "\n\nIMPORTANT: Your previous output did not match the required Markdown structure. "
+              "Re-output ONLY in the exact required structure with three headings (## Article 1/2/3) "
+              "and 200–400 words per article. No code fences."
+        )
         with st.spinner("Repairing output format…"):
             try:
                 repaired = call_claude_markdown(
                     prompt=repair_prompt,
-                    model=model.strip(),
+                    model=model_id.strip(),
                     max_tokens=2500,
                     temperature=float(temperature),
                 )
@@ -363,7 +374,6 @@ if generate:
                 if repaired:
                     md = repaired
             except Exception:
-                # If repair fails, we still show the original md below
                 pass
 
     a1, a2, a3, split_ok = split_into_three_articles(md)
@@ -402,8 +412,8 @@ if st.session_state.result_md:
 
     with st.expander("Troubleshooting", expanded=False):
         st.markdown(
-            "- If you see an API error: confirm **ANTHROPIC_API_KEY** is set in Streamlit Secrets.\n"
-            "- If the model fails: try a different Claude model name in the Context section.\n"
+            "- If you see an authentication error: confirm **ANTHROPIC_API_KEY** is set in Streamlit Secrets.\n"
+            "- If you see a model-not-found error: pick a valid model in **1. Context → Model**.\n"
             "- If outputs feel too generic: add 1–2 lines of optional context and/or increase max answers sent.\n"
         )
 else:
