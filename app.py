@@ -1,5 +1,5 @@
 import re
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict
 
 import streamlit as st
 from anthropic import Anthropic
@@ -72,18 +72,6 @@ def extract_text_from_anthropic_message(message) -> str:
     return "\n".join(parts).strip()
 
 
-def looks_like_valid_output(md: str) -> bool:
-    if not md or not md.strip():
-        return False
-    if "```" in md:
-        return False
-    needed = [r"^##\s*Article\s*1\b", r"^##\s*Article\s*2\b", r"^##\s*Article\s*3\b"]
-    for pat in needed:
-        if not re.search(pat, md, flags=re.MULTILINE | re.IGNORECASE):
-            return False
-    return True
-
-
 def strip_code_fences(md: str) -> str:
     fenced = re.match(r"^\s*```(?:\w+)?\s*(.*?)\s*```\s*$", md, flags=re.DOTALL)
     if fenced:
@@ -92,55 +80,84 @@ def strip_code_fences(md: str) -> str:
     return md.strip()
 
 
-def split_into_three_articles(md: str) -> Tuple[str, str, str, bool]:
-    pattern = r"(?m)^##\s*Article\s*([123])\b.*$"
-    matches = list(re.finditer(pattern, md, flags=re.IGNORECASE | re.MULTILINE))
-    if len(matches) < 3:
-        return md.strip(), "", "", False
+def looks_like_valid_output(md: str, n_articles: int) -> bool:
+    if not md or not md.strip():
+        return False
+    if "```" in md:
+        return False
 
-    starts: Dict[str, int] = {}
+    for i in range(1, n_articles + 1):
+        if not re.search(rf"(?m)^##\s*Article\s*{i}\b", md, flags=re.IGNORECASE):
+            return False
+    return True
+
+
+def split_into_n_articles(md: str, n_articles: int) -> Tuple[List[str], bool]:
+    """
+    Split output into N Markdown strings based on headings:
+    ## Article 1 ...
+    ## Article 2 ...
+    ...
+    Returns ([a1..aN], success_flag)
+    """
+    pattern = r"(?m)^##\s*Article\s*(\d+)\b.*$"
+    matches = list(re.finditer(pattern, md, flags=re.IGNORECASE | re.MULTILINE))
+    if not matches:
+        return [md.strip()], False
+
+    # Find first occurrence start for each article number
+    starts: Dict[int, int] = {}
     for m in matches:
-        num = m.group(1)
-        if num not in starts:
+        try:
+            num = int(m.group(1))
+        except Exception:
+            continue
+        if 1 <= num <= n_articles and num not in starts:
             starts[num] = m.start()
 
-    if not all(k in starts for k in ("1", "2", "3")):
-        return md.strip(), "", "", False
+    if not all(i in starts for i in range(1, n_articles + 1)):
+        return [md.strip()], False
 
-    ordered = sorted(((k, v) for k, v in starts.items()), key=lambda x: x[1])
-    slices = {}
-    for i, (num, start) in enumerate(ordered):
-        end = ordered[i + 1][1] if i + 1 < len(ordered) else len(md)
+    ordered = sorted(starts.items(), key=lambda x: x[1])  # [(num, start), ...]
+    slices: Dict[int, str] = {}
+
+    for idx, (num, start) in enumerate(ordered):
+        end = ordered[idx + 1][1] if idx + 1 < len(ordered) else len(md)
         slices[num] = md[start:end].strip()
 
-    return slices["1"], slices["2"], slices["3"], True
+    return [slices[i] for i in range(1, n_articles + 1)], True
 
 
-def build_prompt(question: str, answers: List[str], optional_context: str, company_name: str) -> str:
+def build_prompt(question: str, answers: List[str], optional_context: str, n_articles: int) -> str:
     answers_block = "\n".join([f"{i+1}. {a}" for i, a in enumerate(answers)])
     ctx = (optional_context or "").strip()
     ctx_block = ctx if ctx else "No extra context provided."
 
+    # Build exact required structure for N articles
+    structure_lines = []
+    for i in range(1, n_articles + 1):
+        structure_lines.append(f"## Article {i} — <Angle title>\n<200–400 words>\n")
+    structure_block = "\n".join(structure_lines).strip()
+
     return f"""
-You are a senior thought-leadership writer specialising in the forest industry and its value chain (pulp, paper, packaging, hygiene, timber, printing/publishing, brand owners, converters, logistics, procurement, sustainability, innovation).
+You are writing as Opticom: a leading consultancy in the forest industry known for high-quality stakeholder dialogues and close contact with decision-makers across the value chain.
 
 TASK
-Write THREE distinct LinkedIn articles based on patterns found in real interview answers.
+Based on patterns across many anonymised interview answers, write {n_articles} distinct LinkedIn articles.
 
 CONFIDENTIALITY (CRITICAL)
 - Do NOT mention any client, brand, mill, retailer, or company names.
-- Do NOT reference specific projects, geographies that could identify a single account, or “one specific customer”.
-- Do NOT write “our client told us X”.
+- Do NOT reference specific projects, contract details, or anything that could identify a single account.
+- Do NOT write “a client told us X” or “our customer said…”.
 - Use aggregated language such as “Across many conversations…” / “A recurring pattern is…”.
 - Keep it concrete enough to feel real, but abstract enough to protect confidentiality.
-- Avoid quoting verbatim sentences from the input.
+- Avoid verbatim quotes from the input.
 
-POSITIONING (SUBTLE)
-Without being salesy, subtly position {company_name} as:
-- close to customers’ customers across the forest industry value chain,
-- able to see patterns others miss,
-- focused on strategic, forward-looking issues.
-You MAY mention {company_name} by name lightly (max 1–2 times total across all articles), but the authority must come from insight, not promotion.
+VOICE & POSITIONING (IMPORTANT)
+- Write from Opticom’s perspective (“we”), but stay humble and down to earth.
+- Subtly signal that we are close to customers’ customers, able to spot patterns others miss, and focused on forward-looking issues.
+- No sales language. No CTA like “contact us” / “book a call”.
+- Credibility should come from insight, not promotion.
 
 INPUTS
 Interview question:
@@ -156,27 +173,19 @@ OUTPUT REQUIREMENTS (STRICT)
 - Output MARKDOWN ONLY.
 - Output EXACTLY in this structure (no extra sections before/after):
 
-## Article 1 — <Angle title>
-<200–400 words>
-
-## Article 2 — <Angle title>
-<200–400 words>
-
-## Article 3 — <Angle title>
-<200–400 words>
+{structure_block}
 
 STYLE (LinkedIn-ready)
 - Strong opening hook (1–2 short paragraphs).
 - Scannable formatting: short paragraphs; optional bullet list (max 4 bullets) if helpful.
-- Thoughtful, reflective, credible; written for senior decision-makers in the forest industry.
+- Thought-leader tone, but grounded and plain-spoken.
 - Clear takeaway at the end (1–2 sentences).
-- Do not use a sales CTA (“contact us”, “book a call”, etc.).
 
 QUALITY BAR
-Each article must have a distinct:
-- angle,
+Each article must have a clearly different:
+- angle (e.g., risk, strategy, operating model, market dynamics, innovation tension, credibility of claims, procurement logic),
 - narrative arc (hook → insight → implications → takeaway),
-- emphasis (choose different themes across the three).
+- emphasis (choose different themes across the set).
 """.strip()
 
 
@@ -211,8 +220,8 @@ st.set_page_config(page_title="NewsCoder", layout="wide")
 st.title("NewsCoder")
 
 st.write(
-    "Turn raw interview answers into **three distinct, insight-driven LinkedIn articles** — "
-    "credible, anonymised, and designed for senior decision-makers in the forest industry."
+    "Paste **one interview question** and **many answers**, and generate **1–5 distinct LinkedIn articles**. "
+    "The output is insight-driven, anonymised, and written from **Opticom’s perspective** — thought-leader, but down to earth."
 )
 
 MODEL_PRESETS = {
@@ -224,16 +233,15 @@ MODEL_PRESETS = {
 }
 
 with st.expander("1. Context", expanded=True):
-    st.caption("Optional framing — keep it light. The app will still work if you leave this empty.")
-    company_name = st.text_input("Company name (used subtly in the articles)", value="Opticom")
+    st.caption("Optional framing. Helpful if you want a specific emphasis, but you can leave it empty.")
 
     optional_context = st.text_area(
-        "Optional context (e.g., what this question was about, what theme you want to emphasise, what audience nuance to consider)",
-        placeholder="Example: These answers come from conversations across the value chain about supply reliability, credibility of claims, and procurement trade-offs.",
+        "Optional context (e.g., what this question was about, what to emphasise, audience nuance)",
+        placeholder="Example: This question touches on supply reliability, credibility of sustainability claims, and how purchasing decisions are actually made across the value chain.",
         height=120,
     )
 
-    col_a, col_b, col_c = st.columns([1.2, 1, 1])
+    col_a, col_b, col_c, col_d = st.columns([1.2, 0.8, 1, 1])
     with col_a:
         model_choice = st.selectbox("Model", list(MODEL_PRESETS.keys()), index=0)
         custom_model = ""
@@ -242,20 +250,26 @@ with st.expander("1. Context", expanded=True):
 
         model_id = custom_model.strip() if custom_model.strip() else MODEL_PRESETS[model_choice]
         if model_id == "__custom__":
-            model_id = ""  # force validation below
-
-        st.caption(
-            "If you previously used `claude-3-5-sonnet-latest`, it will 404 (model ID no longer exists). "
-            "Use one of the options above."
-        )
+            model_id = ""  # force validation
 
     with col_b:
-        max_answers_to_send = st.number_input("Max answers to send to Claude", min_value=20, max_value=500, value=160, step=10)
+        n_articles = st.selectbox("Number of LinkedIn articles", options=[1, 2, 3, 4, 5], index=2)
+
     with col_c:
+        max_answers_to_send = st.number_input(
+            "Max answers to send to Claude",
+            min_value=20,
+            max_value=500,
+            value=160,
+            step=10,
+        )
+
+    with col_d:
         temperature = st.slider("Creativity (temperature)", min_value=0.0, max_value=1.0, value=0.6, step=0.05)
+        st.caption("Lower = more conservative and consistent. Higher = more varied angles and phrasing.")
 
 with st.expander("2. Paste Input", expanded=True):
-    st.caption("Paste directly from Excel. Each row can have multiple columns; the app will pick the longest cell per row as the answer.")
+    st.caption("Paste directly from Excel. If a row has multiple columns, the app picks the longest cell as the answer.")
     question = st.text_input("Interview question", placeholder="Paste the interview question here…")
 
     st.markdown("**Paste answers (copied from Excel)**")
@@ -275,10 +289,9 @@ generate = st.button("Generate", type="primary", use_container_width=True)
 
 if "result_md" not in st.session_state:
     st.session_state.result_md = ""
-    st.session_state.article_1 = ""
-    st.session_state.article_2 = ""
-    st.session_state.article_3 = ""
+    st.session_state.articles = []
     st.session_state.parse_info = ""
+    st.session_state.n_articles_last = 3
 
 if generate:
     # --- Validation
@@ -311,16 +324,16 @@ if generate:
         question=question,
         answers=sampled_answers,
         optional_context=optional_context,
-        company_name=company_name.strip() or "Opticom",
+        n_articles=int(n_articles),
     )
 
     # --- Call Claude
-    with st.spinner("Generating three LinkedIn articles…"):
+    with st.spinner(f"Generating {int(n_articles)} LinkedIn article(s)…"):
         try:
             md = call_claude_markdown(
                 prompt=prompt,
                 model=model_id.strip(),
-                max_tokens=2500,
+                max_tokens=3200,  # enough headroom for up to 5 articles
                 temperature=float(temperature),
             )
         except NotFoundError as e:
@@ -355,19 +368,19 @@ if generate:
         md = strip_code_fences(md)
 
     # Validate format; if invalid, attempt ONE repair call
-    if not looks_like_valid_output(md):
+    if not looks_like_valid_output(md, int(n_articles)):
         repair_prompt = (
             prompt
             + "\n\nIMPORTANT: Your previous output did not match the required Markdown structure. "
-              "Re-output ONLY in the exact required structure with three headings (## Article 1/2/3) "
-              "and 200–400 words per article. No code fences."
+              f"Re-output ONLY in the exact required structure with headings ## Article 1..{int(n_articles)} "
+              "and 200–400 words per article. No code fences. No extra text before/after."
         )
         with st.spinner("Repairing output format…"):
             try:
                 repaired = call_claude_markdown(
                     prompt=repair_prompt,
                     model=model_id.strip(),
-                    max_tokens=2500,
+                    max_tokens=3200,
                     temperature=float(temperature),
                 )
                 repaired = strip_code_fences((repaired or "").strip())
@@ -376,17 +389,16 @@ if generate:
             except Exception:
                 pass
 
-    a1, a2, a3, split_ok = split_into_three_articles(md)
+    articles, split_ok = split_into_n_articles(md, int(n_articles))
 
     st.session_state.result_md = md
-    st.session_state.article_1 = a1
-    st.session_state.article_2 = a2
-    st.session_state.article_3 = a3
+    st.session_state.articles = articles
+    st.session_state.n_articles_last = int(n_articles)
 
     if not split_ok:
         st.warning(
-            "Claude did not return the exact expected structure (3 headings). "
-            "Showing the raw output in the Copy section so you can still use it."
+            "Claude didn’t return the exact expected structure (Article 1..N). "
+            "Showing raw output in the Copy section so you can still use it."
         )
 
 # ---------------------------
@@ -397,14 +409,16 @@ if st.session_state.result_md:
     st.subheader("Results")
     st.info(st.session_state.parse_info)
 
-    tab1, tab2, tab3 = st.tabs(["Article 1", "Article 2", "Article 3"])
+    n = st.session_state.n_articles_last
+    tabs = st.tabs([f"Article {i}" for i in range(1, n + 1)])
 
-    with tab1:
-        st.markdown(st.session_state.article_1 or "_No Article 1 parsed._")
-    with tab2:
-        st.markdown(st.session_state.article_2 or "_No Article 2 parsed._")
-    with tab3:
-        st.markdown(st.session_state.article_3 or "_No Article 3 parsed._")
+    # If parsing failed, we might only have 1 blob
+    for i, tab in enumerate(tabs, start=1):
+        with tab:
+            if i - 1 < len(st.session_state.articles):
+                st.markdown(st.session_state.articles[i - 1])
+            else:
+                st.markdown("_No parsed content for this tab._")
 
     with st.expander("Copy (Markdown)", expanded=False):
         st.caption("Tip: Use the copy icon in the top-right of the code block.")
@@ -412,9 +426,10 @@ if st.session_state.result_md:
 
     with st.expander("Troubleshooting", expanded=False):
         st.markdown(
-            "- If you see an authentication error: confirm **ANTHROPIC_API_KEY** is set in Streamlit Secrets.\n"
-            "- If you see a model-not-found error: pick a valid model in **1. Context → Model**.\n"
-            "- If outputs feel too generic: add 1–2 lines of optional context and/or increase max answers sent.\n"
+            "- Authentication error: confirm **ANTHROPIC_API_KEY** is set in Streamlit Secrets.\n"
+            "- Model-not-found: pick a valid model in **1. Context → Model**.\n"
+            "- Too generic: add 1–2 lines of optional context and/or increase max answers sent.\n"
+            "- Too similar articles: raise temperature slightly or increase number of answers.\n"
         )
 else:
-    st.caption("Paste a question + answers, then click **Generate**.")
+    st.caption("Paste a question + answers, choose number of articles, then click **Generate**.")
